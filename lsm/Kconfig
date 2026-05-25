@@ -1,0 +1,20 @@
+config SECURITY_PROVFS
+	bool "provfs: stamp user.prov.* xattrs on writes"
+	depends on SECURITY
+	default n
+	help
+	  provfs is a small, stackable Linux Security Module that stamps
+	  user.prov.session and user.prov.ts xattrs on every file
+	  successfully closed after being opened for write.
+
+	  The session value is "comm:<comm>:pid:<tgid>:uid:<uid>".
+	  Files under /proc, /sys, /dev, /run, /tmp, .git, node_modules,
+	  target, and the cargo registry are skipped.
+
+	  Pairs with the userspace FUSE-overlay provfs daemon (which
+	  handles filesystems that don't support user xattrs natively)
+	  and a userspace `prov` CLI for reading the xattrs.
+
+	  See Documentation/admin-guide/LSM/provfs.rst.
+
+	  If unsure, say N.
