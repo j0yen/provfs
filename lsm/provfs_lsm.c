@@ -9,9 +9,18 @@
  *   user.prov.session = "comm:<comm>:pid:<tgid>:uid:<uid>"
  *   user.prov.ts      = "<unix_seconds>"
  *
+ * v0.2 (PRD-provfs-deferred-stamp): the actual xattr writes are
+ * deferred to a bounded workqueue (provfs_work.c). The hook does only
+ * the cheap work — guards, path resolution, skip filter, session+ts
+ * rendering — then calls provfs_enqueue_stamp() and returns. This keeps
+ * journaled filesystem writes off the close hot path and off the
+ * task-teardown context (fput from exit_files()).
+ *
  * Phase 1 (deferred): read $CLAUDE_TOOL / $CLAUDE_SESSION from
  * current->mm via access_remote_vm() and prefer those over the
  * comm-derived session id; add user.prov.tool / .turn / .intent.
+ * (Now trivially safe to capture at hook time and carry in the work
+ * payload, since the worker no longer depends on the original task.)
  *
  * Phase 2 (deferred): history ring (user.prov.history).
  *
@@ -36,15 +45,13 @@
 #include <linux/uidgid.h>
 #include <linux/xattr.h>
 
+#include "provfs_work.h"
+
 #ifdef CONFIG_AGENT_NS
 #include <linux/agent_namespaces.h>
 #endif
 
 #define PROVFS_NAME		"provfs"
-#define PROV_SESSION_KEY	XATTR_USER_PREFIX "prov.session"
-#define PROV_TS_KEY		XATTR_USER_PREFIX "prov.ts"
-#define PROV_IDENT_MAX		96	/* "comm:<TASK_COMM_LEN>:pid:<u32>:uid:<u32>" fits */
-#define PROV_TS_MAX		24
 
 /*
  * Hard-coded skip-prefix list (v0.1). The PRD calls for a sysctl-tunable
@@ -96,9 +103,12 @@ static void provfs_build_session(char *buf, size_t buflen)
 }
 
 /*
- * Stamp xattrs on the file. Called from file_release for writes;
- * the calling task may be exiting (fput from exit_files), so we must
- * not touch current->fs.
+ * Hook-side: do the cheap work and enqueue. Called from file_release
+ * for writes; the calling task may be exiting (fput from exit_files),
+ * so we must not touch current->fs.
+ *
+ * The journaled xattr writes themselves happen later, on the provfs
+ * workqueue (see provfs_work.c).
  */
 static void provfs_stamp(struct file *file)
 {
@@ -145,10 +155,8 @@ static void provfs_stamp(struct file *file)
 	provfs_build_session(session_val, sizeof(session_val));
 	snprintf(ts_val, sizeof(ts_val), "%lld", ktime_get_real_seconds());
 
-	(void)__vfs_setxattr_noperm(idmap, dentry, PROV_SESSION_KEY,
-				    session_val, strlen(session_val), 0);
-	(void)__vfs_setxattr_noperm(idmap, dentry, PROV_TS_KEY,
-				    ts_val, strlen(ts_val), 0);
+	/* Defer the journaled xattr writes off this hot/teardown path. */
+	provfs_enqueue_stamp(dentry, idmap, session_val, ts_val);
 }
 
 static void provfs_file_release(struct file *file)
@@ -169,8 +177,24 @@ static const struct lsm_id provfs_lsmid = {
 
 static int __init provfs_init(void)
 {
+	int ret;
+
 	security_add_hooks(provfs_hooks, ARRAY_SIZE(provfs_hooks), &provfs_lsmid);
-	pr_info("provfs: LSM registered (v0.1)\n");
+
+	ret = provfs_work_init();
+	if (ret) {
+		/*
+		 * Hooks are already registered and __ro_after_init; we can't
+		 * pull them back out. Without a workqueue every enqueue drops,
+		 * so the LSM degrades to a no-op rather than crashing. Log
+		 * loudly and carry on.
+		 */
+		pr_err("provfs: workqueue init failed (%d); stamping disabled\n",
+		       ret);
+		return ret;
+	}
+
+	pr_info("provfs: LSM registered (v0.2, deferred stamping)\n");
 	return 0;
 }
 

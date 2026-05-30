@@ -15,6 +15,11 @@ config SECURITY_PROVFS
 	  handles filesystems that don't support user xattrs natively)
 	  and a userspace `prov` CLI for reading the xattrs.
 
+	  The xattr writes are deferred to a bounded workqueue so the
+	  file_release hook stays off the journaled-write hot path; tune
+	  the in-flight bound via /proc/sys/kernel/provfs/queue_max and
+	  observe drops via .../queue_dropped.
+
 	  See Documentation/admin-guide/LSM/provfs.rst.
 
 	  If unsure, say N.
