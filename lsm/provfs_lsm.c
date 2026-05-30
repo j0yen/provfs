@@ -96,8 +96,9 @@ static void provfs_build_session(char *buf, size_t buflen)
 }
 
 /*
- * Stamp xattrs on the file. Called only from file_release for writes,
- * which is process context — sleeping is allowed.
+ * Stamp xattrs on the file. Called from file_release for writes;
+ * the calling task may be exiting (fput from exit_files), so we must
+ * not touch current->fs.
  */
 static void provfs_stamp(struct file *file)
 {
@@ -109,6 +110,16 @@ static void provfs_stamp(struct file *file)
 	char session_val[PROV_IDENT_MAX];
 	char ts_val[PROV_TS_MAX];
 
+	/*
+	 * file_release fires during fput, including from exit_files() after
+	 * exit_fs() has cleared current->fs. d_path() consults
+	 * current->fs->root and NULL-derefs in that window — observed as
+	 * d_path+0xa2 -> provfs_stamp+0x129 oopses. Use d_absolute_path(),
+	 * which renders the path relative to the global root and never
+	 * reads current->fs.
+	 */
+	if (!file->f_path.mnt || !file->f_path.dentry)
+		return;
 	dentry = file_dentry(file);
 	if (!dentry)
 		return;
@@ -120,8 +131,8 @@ static void provfs_stamp(struct file *file)
 	path_buf = kmalloc(PATH_MAX, GFP_KERNEL);
 	if (!path_buf)
 		return;
-	path_str = d_path(&file->f_path, path_buf, PATH_MAX);
-	if (IS_ERR(path_str)) {
+	path_str = d_absolute_path(&file->f_path, path_buf, PATH_MAX);
+	if (IS_ERR_OR_NULL(path_str)) {
 		kfree(path_buf);
 		return;
 	}
