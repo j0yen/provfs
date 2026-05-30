@@ -21,6 +21,7 @@
  */
 
 #include <linux/atomic.h>
+#include <linux/cred.h>	/* current_fsuid()/current_fsgid() via mnt_idmapping.h */
 #include <linux/dcache.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
