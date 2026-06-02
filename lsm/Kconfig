@@ -7,7 +7,15 @@ config SECURITY_PROVFS
 	  user.prov.session and user.prov.ts xattrs on every file
 	  successfully closed after being opened for write.
 
-	  The session value is "comm:<comm>:pid:<tgid>:uid:<uid>".
+	  When the writer is inside an agent namespace the session value is
+	  the 32-hex AgentNS session id. Otherwise an enriched fallback is
+	  stamped: "comm-chain:<c0>>..;env:<KEY>=<val>;cwd:<path>;pid:<p>;
+	  uid:<u>" — the parent comm chain (up to 3 levels), the first of
+	  $CLAUDE_TOOL/$AGORABUS_SID/$CLAUDE_SESSION_ID found in the writer's
+	  env, and the writer's cwd. The value is capped at 256 bytes;
+	  truncation drops fields from the right so the outermost actor is
+	  preserved.
+
 	  Files under /proc, /sys, /dev, /run, /tmp, .git, node_modules,
 	  target, and the cargo registry are skipped.
 
