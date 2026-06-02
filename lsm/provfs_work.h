@@ -20,7 +20,16 @@ struct mnt_idmap;
 /* Shared with provfs_lsm.c — sizes of the rendered value strings. */
 #define PROV_SESSION_KEY	XATTR_USER_PREFIX "prov.session"
 #define PROV_TS_KEY		XATTR_USER_PREFIX "prov.ts"
-#define PROV_IDENT_MAX		96	/* "comm:<TASK_COMM_LEN>:pid:<u32>:uid:<u32>" fits */
+/*
+ * v0.3 (PRD-provfs-comm-richer): the enriched fallback value
+ * (comm-chain;env;cwd;pid;uid) is bounded at 256 bytes per §2.2. The
+ * agentns hex id and the legacy comm: form are both far shorter, so one
+ * cap covers all three. This is the §1.3 hook-time capture buffer: the
+ * full enriched string is rendered in the hook (provfs_build_session)
+ * and carried through the work payload's session[] field, so the worker
+ * never has to re-read the (possibly torn-down) originating task.
+ */
+#define PROV_IDENT_MAX		256
 #define PROV_TS_MAX		24
 
 /*

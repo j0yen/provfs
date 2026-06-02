@@ -16,11 +16,27 @@
  * journaled filesystem writes off the close hot path and off the
  * task-teardown context (fput from exit_files()).
  *
- * Phase 1 (deferred): read $CLAUDE_TOOL / $CLAUDE_SESSION from
- * current->mm via access_remote_vm() and prefer those over the
- * comm-derived session id; add user.prov.tool / .turn / .intent.
- * (Now trivially safe to capture at hook time and carry in the work
- * payload, since the worker no longer depends on the original task.)
+ * v0.3 (PRD-provfs-comm-richer): the fallback path (agentns session id
+ * absent) is enriched. Instead of "comm:<comm>:pid:<pid>:uid:<uid>",
+ * which names the innermost child of a pipeline (awk/sed/install) rather
+ * than the meaningful actor, the fallback composes a structured value:
+ *
+ *   comm-chain:<comm0>>...>;env:<KEY>=<val>;cwd:<path>;pid:<pid>;uid:<uid>
+ *
+ * Fields are key:value pairs separated by ';' in a fixed order
+ * (comm-chain, env, cwd, pid, uid). Any field may be absent; pid+uid are
+ * always present (cheap, never fail). The whole value is capped at
+ * PROV_IDENT_MAX bytes; truncation drops fields from the right so the
+ * outermost-actor signal (comm-chain) is preserved per §2.2.
+ *
+ * All of this is rendered at hook time (in provfs_build_session, called
+ * from provfs_stamp while still in the writer's task context) and copied
+ * into the work payload's session[] field. The deferred worker never
+ * re-reads the originating task — exactly the §1.3 hook-time capture
+ * buffer the deferred-stamp PRD anticipated. current->mm and current->fs
+ * are read best-effort, each guarded; on teardown the field is omitted.
+ *
+ * The agentns-present path is unchanged: still the bare 32-hex id.
  *
  * Phase 2 (deferred): history ring (user.prov.history).
  *
@@ -32,16 +48,22 @@
 
 #include <linux/dcache.h>
 #include <linux/fs.h>
+#include <linux/fs_struct.h>	/* get_fs_pwd() for the cwd field */
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/lsm_hooks.h>
+#include <linux/mm.h>		/* access_remote_vm() for the env field */
 #include <linux/mnt_idmapping.h>
 #include <linux/mount.h>
 #include <linux/nsproxy.h>
 #include <linux/path.h>
+#include <linux/rcupdate.h>	/* rcu_dereference_protected in comm-chain walk */
 #include <linux/sched.h>
+#include <linux/sched/mm.h>	/* get_task_mm()/mmput() */
+#include <linux/sched/task.h>	/* tasklist_lock / real_parent walk */
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/uaccess.h>
 #include <linux/uidgid.h>
 #include <linux/xattr.h>
 
@@ -52,6 +74,21 @@
 #endif
 
 #define PROVFS_NAME		"provfs"
+
+/* Enrichment sub-field caps (PRD-provfs-comm-richer §2.1). */
+#define PROV_CHAIN_MAX		128	/* "comm0>comm1>comm2" + slack */
+#define PROV_CHAIN_LEVELS	3	/* current + up to 2 ancestors */
+#define PROV_ENV_KEY_MAX	24
+#define PROV_ENV_VAL_MAX	48
+#define PROV_ENV_SCAN_MAX	4096	/* env bytes we are willing to scan */
+
+/* Env vars searched, in priority order; first match wins (§2.1, §4). */
+static const char * const provfs_env_keys[] = {
+	"CLAUDE_TOOL=",
+	"AGORABUS_SID=",
+	"CLAUDE_SESSION_ID=",
+	NULL,
+};
 
 /*
  * Hard-coded skip-prefix list (v0.1). The PRD calls for a sysctl-tunable
@@ -77,16 +114,270 @@ static bool provfs_path_skipped(const char *path)
 	return false;
 }
 
+/* True for the synthetic roots we stop the parent-walk at (§2.1). */
+static bool provfs_is_root_comm(const char *comm)
+{
+	return !strcmp(comm, "init") || !strcmp(comm, "systemd") ||
+	       !strcmp(comm, "kthreadd");
+}
+
+/*
+ * Build "comm0>comm1>comm2" by walking current->real_parent up to
+ * PROV_CHAIN_LEVELS levels. Stops early when the current/next ancestor
+ * is init/systemd/kthreadd (a system root carries no actor signal). The
+ * walk holds the tasklist read-lock so real_parent can't be freed
+ * mid-walk; get_task_comm copies under the task's own lock. Best
+ * effort — on any oddity we just emit what we have so far.
+ *
+ * Returns the number of bytes written (excluding NUL), 0 if nothing.
+ */
+static size_t provfs_build_comm_chain(char *buf, size_t buflen)
+{
+	struct task_struct *t = current;
+	char comm[TASK_COMM_LEN];
+	size_t off = 0;
+	int level;
+
+	if (!buf || buflen == 0)
+		return 0;
+	buf[0] = '\0';
+
+	read_lock(&tasklist_lock);
+	for (level = 0; level < PROV_CHAIN_LEVELS && t; level++) {
+		int n;
+
+		get_task_comm(comm, t);
+
+		/*
+		 * Don't lead with a root comm, and don't append one as an
+		 * ancestor — stop the chain at the first meaningful boundary.
+		 */
+		if (provfs_is_root_comm(comm))
+			break;
+
+		n = snprintf(buf + off, buflen - off, "%s%s",
+			     off ? ">" : "", comm);
+		if (n < 0 || (size_t)n >= buflen - off) {
+			/* Out of room; keep what fit. */
+			break;
+		}
+		off += n;
+
+		t = rcu_dereference_protected(t->real_parent,
+					      lockdep_is_held(&tasklist_lock));
+		/* PID 1 / swapper sentinel: nothing useful above it. */
+		if (t && (t->pid == 1 || t->pid == 0))
+			break;
+	}
+	read_unlock(&tasklist_lock);
+
+	return off;
+}
+
+/*
+ * Search the current task's environment for the first of
+ * provfs_env_keys[] and render "<KEY>=<val>" (KEY without the '=',
+ * value truncated to PROV_ENV_VAL_MAX). Best effort: returns 0 if mm is
+ * gone, env region is unreadable, or no key matched. Reads at most
+ * PROV_ENV_SCAN_MAX bytes of the env block via access_remote_vm().
+ *
+ * Returns bytes written (excluding NUL), 0 on miss.
+ */
+static size_t provfs_build_env_signal(char *buf, size_t buflen)
+{
+	struct mm_struct *mm;
+	char *env = NULL;
+	unsigned long start, end, len;
+	size_t got, out = 0;
+	size_t i;
+	const char *const *k;
+
+	if (!buf || buflen == 0)
+		return 0;
+	buf[0] = '\0';
+
+	mm = get_task_mm(current);
+	if (!mm)
+		return 0;
+
+	/*
+	 * env_start/env_end bound argv's trailing environ block. They can
+	 * be zero or inverted on odd execs; guard before subtracting.
+	 */
+	start = mm->env_start;
+	end = mm->env_end;
+	if (!start || !end || end <= start)
+		goto out_mm;
+
+	len = end - start;
+	if (len > PROV_ENV_SCAN_MAX)
+		len = PROV_ENV_SCAN_MAX;
+
+	env = kmalloc(len + 1, GFP_KERNEL);
+	if (!env)
+		goto out_mm;
+
+	got = access_remote_vm(mm, start, env, len, 0);
+	if (got == 0)
+		goto out_free;
+	env[got] = '\0';
+
+	/*
+	 * The env block is a run of NUL-separated "KEY=value" entries.
+	 * Walk entry by entry; for each, test the priority key list.
+	 */
+	i = 0;
+	while (i < got) {
+		const char *entry = env + i;
+		size_t elen = strnlen(entry, got - i);
+
+		for (k = provfs_env_keys; *k; k++) {
+			size_t klen = strlen(*k);
+
+			if (elen > klen && !strncmp(entry, *k, klen)) {
+				const char *val = entry + klen;
+				/* Drop the trailing '=' from the key label. */
+				char key[PROV_ENV_KEY_MAX];
+				size_t kn = klen - 1;
+
+				if (kn >= sizeof(key))
+					kn = sizeof(key) - 1;
+				memcpy(key, *k, kn);
+				key[kn] = '\0';
+
+				out = scnprintf(buf, buflen, "%s=%.*s", key,
+						PROV_ENV_VAL_MAX, val);
+				goto out_free;
+			}
+		}
+
+		/* Advance past this entry's NUL terminator. */
+		i += elen + 1;
+	}
+
+out_free:
+	kfree(env);
+out_mm:
+	mmput(mm);
+	return out;
+}
+
+/*
+ * Render the writer's cwd via get_fs_pwd() + d_absolute_path() — the
+ * same root-relative renderer provfs_stamp() uses for the file path, so
+ * it is safe even when current->fs is being torn down (it takes its own
+ * reference). Returns bytes written, 0 on failure.
+ */
+static size_t provfs_build_cwd(char *buf, size_t buflen)
+{
+	struct path pwd;
+	char *page;
+	char *p;
+	size_t out = 0;
+
+	if (!buf || buflen == 0)
+		return 0;
+	buf[0] = '\0';
+
+	if (!current->fs)
+		return 0;
+	get_fs_pwd(current->fs, &pwd);
+	if (!pwd.dentry || !pwd.mnt) {
+		path_put(&pwd);
+		return 0;
+	}
+
+	page = kmalloc(PATH_MAX, GFP_KERNEL);
+	if (!page) {
+		path_put(&pwd);
+		return 0;
+	}
+
+	p = d_absolute_path(&pwd, page, PATH_MAX);
+	if (!IS_ERR_OR_NULL(p))
+		out = scnprintf(buf, buflen, "%s", p);
+
+	kfree(page);
+	path_put(&pwd);
+	return out;
+}
+
+/*
+ * Compose the enriched fallback value (agentns absent). Fixed field
+ * order: comm-chain, env, cwd, pid, uid. Each field is appended only if
+ * it fits in full within @buflen; pid+uid always fit (the buffer is
+ * sized for them). This drops fields from the right on overflow, which
+ * preserves the outermost-actor signal at the front per §2.2.
+ */
+static void provfs_build_fallback(char *buf, size_t buflen)
+{
+	char chain[PROV_CHAIN_MAX];
+	char env[PROV_ENV_KEY_MAX + PROV_ENV_VAL_MAX + 2];
+	char *cwd;
+	u32 uid = from_kuid(&init_user_ns, current_uid());
+	u32 pid = (u32)current->tgid;
+	size_t off = 0;
+	int n;
+
+	buf[0] = '\0';
+
+	/* comm-chain (outermost actor signal — emitted first). */
+	if (provfs_build_comm_chain(chain, sizeof(chain)) > 0) {
+		n = snprintf(buf + off, buflen - off, "%scomm-chain:%s",
+			     off ? ";" : "", chain);
+		if (n > 0 && (size_t)n < buflen - off)
+			off += n;
+	}
+
+	/* env signal (CLAUDE_TOOL / AGORABUS_SID / CLAUDE_SESSION_ID). */
+	if (provfs_build_env_signal(env, sizeof(env)) > 0) {
+		n = snprintf(buf + off, buflen - off, "%senv:%s",
+			     off ? ";" : "", env);
+		if (n > 0 && (size_t)n < buflen - off)
+			off += n;
+	}
+
+	/* cwd. PATH_MAX is large; heap-allocate to keep the stack frame small. */
+	cwd = kmalloc(PATH_MAX, GFP_KERNEL);
+	if (cwd) {
+		if (provfs_build_cwd(cwd, PATH_MAX) > 0) {
+			n = snprintf(buf + off, buflen - off, "%scwd:%s",
+				     off ? ";" : "", cwd);
+			if (n > 0 && (size_t)n < buflen - off)
+				off += n;
+		}
+		kfree(cwd);
+	}
+
+	/* pid (always). */
+	n = snprintf(buf + off, buflen - off, "%spid:%u",
+		     off ? ";" : "", pid);
+	if (n > 0 && (size_t)n < buflen - off)
+		off += n;
+
+	/* uid (always). */
+	n = snprintf(buf + off, buflen - off, "%suid:%u",
+		     off ? ";" : "", uid);
+	if (n > 0 && (size_t)n < buflen - off)
+		off += n;
+
+	/*
+	 * Defensive: if pid/uid somehow couldn't fit (pathological buflen),
+	 * guarantee a non-empty, parseable value.
+	 */
+	if (buf[0] == '\0')
+		snprintf(buf, buflen, "pid:%u;uid:%u", pid, uid);
+}
+
 static void provfs_build_session(char *buf, size_t buflen)
 {
-	char comm[TASK_COMM_LEN];
-	u32 uid;
-
 #ifdef CONFIG_AGENT_NS
 	/*
-	 * Phase 3: prefer the AgentNS session id when the current task is
-	 * inside a non-init agent namespace. The id is opaque 128 bits;
-	 * agent_session_id_format renders it as a hex/UUID-ish string.
+	 * Prefer the AgentNS session id when the current task is inside a
+	 * non-init agent namespace. The id is opaque 128 bits;
+	 * agent_session_id_format renders it as a hex/UUID-ish string. This
+	 * path is intentionally left UNCHANGED by PRD-provfs-comm-richer —
+	 * enrichment applies only to the fallback below.
 	 */
 	if (current->nsproxy && current->nsproxy->agent_ns &&
 	    current->nsproxy->agent_ns != &init_agent_ns) {
@@ -96,10 +387,13 @@ static void provfs_build_session(char *buf, size_t buflen)
 			return;
 	}
 #endif
-	get_task_comm(comm, current);
-	uid = from_kuid(&init_user_ns, current_uid());
-	snprintf(buf, buflen, "comm:%s:pid:%u:uid:%u",
-		 comm, (u32)current->tgid, uid);
+	/*
+	 * Fallback (PRD-provfs-comm-richer): agentns id absent. Compose the
+	 * enriched comm-chain;env;cwd;pid;uid value instead of the old
+	 * innermost-comm-only string. Rendered here at hook time (writer's
+	 * task context) and carried verbatim through the work payload.
+	 */
+	provfs_build_fallback(buf, buflen);
 }
 
 /*
@@ -127,6 +421,12 @@ static void provfs_stamp(struct file *file)
 	 * d_path+0xa2 -> provfs_stamp+0x129 oopses. Use d_absolute_path(),
 	 * which renders the path relative to the global root and never
 	 * reads current->fs.
+	 *
+	 * Note: provfs_build_session()'s enriched fallback (v0.3) does read
+	 * current->fs (cwd) and current->mm (env), but each via a guarded
+	 * accessor that takes its own reference and omits the field when the
+	 * struct is being torn down — so a half-exited task degrades to a
+	 * partial (still parseable) value rather than oopsing.
 	 */
 	if (!file->f_path.mnt || !file->f_path.dentry)
 		return;
@@ -194,7 +494,7 @@ static int __init provfs_init(void)
 		return ret;
 	}
 
-	pr_info("provfs: LSM registered (v0.2, deferred stamping)\n");
+	pr_info("provfs: LSM registered (v0.3, deferred stamping + enriched fallback)\n");
 	return 0;
 }
 
