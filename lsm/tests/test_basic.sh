@@ -30,10 +30,17 @@ ts=$(getfattr --only-values -n user.prov.ts "$F" 2>/dev/null)
 [[ -n "$session" ]] && ok "user.prov.session stamped" || no "user.prov.session" "missing"
 [[ -n "$ts"      ]] && ok "user.prov.ts stamped"      || no "user.prov.ts"      "missing"
 
-# 2. session format is "comm:...:pid:N:uid:N"
-echo "$session" | grep -qE '^comm:[^:]+:pid:[0-9]+:uid:[0-9]+$' \
-    && ok "session value is comm:pid:uid form" \
-    || no "session format" "got '$session'"
+# 2. session format is either the legacy "comm:...:pid:N:uid:N" OR, post
+#    PRD-provfs-comm-richer, the enriched fallback "...;pid:N;uid:N", OR a
+#    bare 32-hex agentns id. Accept all three so this functional test is
+#    deploy-version agnostic; test_comm_richer.sh asserts the enriched shape.
+if echo "$session" | grep -qE '^comm:[^:]+:pid:[0-9]+:uid:[0-9]+$' \
+    || echo "$session" | grep -qE '(^|;)pid:[0-9]+;uid:[0-9]+$' \
+    || echo "$session" | grep -qE '^[0-9a-f]{32}$'; then
+    ok "session value is a recognized provfs identity form"
+else
+    no "session format" "got '$session'"
+fi
 
 # 3. ts is unix seconds in the past minute
 now=$(date +%s)
@@ -57,17 +64,26 @@ echo "$got" | grep -qi "no such attribute\|operation not supported" \
     && ok "/proc has no provfs xattrs" \
     || no "/proc skipped" "unexpected getfattr output: $got"
 
-# 6. session encodes our pid
+# 6. session encodes our pid (legacy ":pid:N:" or enriched ";pid:N" / "pid:N").
+#    Skip if this is an agentns-wrapped (bare 32-hex) session.
 my_pid=$$
-echo "$session" | grep -qE ":pid:${my_pid}(:|$)" \
-    && ok "session pid matches \$\$ ($my_pid)" \
-    || no "session pid" "got '$session', expected pid $my_pid"
+if echo "$session" | grep -qE '^[0-9a-f]{32}$'; then
+    say "session pid (agentns id, no pid field)" "SKIP"
+else
+    echo "$session" | grep -qE "[:;]pid:${my_pid}([:;]|$)" \
+        && ok "session pid matches \$\$ ($my_pid)" \
+        || no "session pid" "got '$session', expected pid $my_pid"
+fi
 
-# 7. session encodes our uid
+# 7. session encodes our uid (legacy ":uid:N" or enriched ";uid:N" / "uid:N").
 my_uid=$(id -u)
-echo "$session" | grep -qE ":uid:${my_uid}(:|$)" \
-    && ok "session uid matches \$(id -u) ($my_uid)" \
-    || no "session uid" "got '$session', expected uid $my_uid"
+if echo "$session" | grep -qE '^[0-9a-f]{32}$'; then
+    say "session uid (agentns id, no uid field)" "SKIP"
+else
+    echo "$session" | grep -qE "[:;]uid:${my_uid}([:;]|$)" \
+        && ok "session uid matches \$(id -u) ($my_uid)" \
+        || no "session uid" "got '$session', expected uid $my_uid"
+fi
 
 if (( FAIL )); then
     echo; echo "test_basic.sh: FAILED"; exit 1
