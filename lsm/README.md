@@ -16,7 +16,7 @@ Phase 0 of [PRD-provenance-fs.md](../../autobuilder/PRDs-archive/PRD-provenance-
 | 0 | `file_release` hook → stamp `user.prov.session` + `user.prov.ts`. Hardcoded skip-prefix list. | shipped |
 | 1 | Read `$CLAUDE_TOOL` / `$CLAUDE_SESSION` from `current->mm` via `access_remote_vm()`. Add `.tool`, `.turn`, `.intent`. | partial — env read shipped in the enriched fallback (v0.3); extra keys deferred |
 | 2 | History ring (`user.prov.history`). | deferred |
-| 3 | AgentNS integration: read `agent_session_id` directly from `current->agent_ns`. | blocked on agentns Phase 3 |
+| 3 | AgentNS integration: read `agent_session_id` directly from `current->agent_ns`. | live — verified 2026-08-31 (first non-init agent NS on the box: `agentns-claude` launcher installed; stamp matched the wrapper's 32-hex session id, distinguishing the direct read from the fallback format) |
 
 ## Layout
 
@@ -67,6 +67,11 @@ getfattr -d ~/hi.txt
 CLAUDE_TOOL=/build bash -c 'echo hi > ~/hi.txt'
 getfattr -n user.prov.session ~/hi.txt
 # user.prov.session="comm-chain:bash;env:CLAUDE_TOOL=/build;cwd:/home/jsy;pid:…;uid:1000"
+
+# inside a real agent namespace (Phase 3 path — needs agentns-claude installed):
+agentns-claude --intent test -- sh -c 'echo hi > ~/hi.txt'
+getfattr -n user.prov.session ~/hi.txt
+# user.prov.session="<32-hex id matching the launcher's session_id>"
 ```
 
 ### Enriched fallback value format (v0.3, PRD-provfs-comm-richer)
