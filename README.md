@@ -51,6 +51,31 @@ Flags: `--source` (backing dir), `--mount` (mountpoint), `--skip` (extra comma-s
 
 By default provfs skips the paths that generate write noise without provenance value: `.git/`, `node_modules/`, `target/`, `.cache/`, `.venv/`, `__pycache__/`, and similar. `--skip private/,secrets/` adds to that set rather than replacing it.
 
+## `prov` — the reader CLI
+
+Phase 1 of the PRD: a small reader that pulls `user.prov.*` back off a real path, from either backend — this overlay or the in-kernel LSM under `lsm/`. No daemon; every subcommand is a one-shot xattr read (plus a recursive walk for `find`).
+
+```sh
+cargo build --release --bin prov
+
+prov show ~/hi.txt          # every user.prov.* key, human-readable
+prov who ~/hi.txt           # just the actor: session id, or comm-chain + uid for a fallback stamp
+prov when ~/hi.txt          # user.prov.ts, rendered as local time + raw
+prov chain ~/hi.txt         # walks user.prov.history: the MRU ring of past sessions on this file
+prov find --tool Edit --since 24h ~/.claude   # recursive, filterable search
+
+# every subcommand also takes --json
+prov show --json ~/hi.txt
+```
+
+`prov find` filters combine: `--tool <t>` (exact match on `user.prov.tool`), `--session <prefix>` (prefix match on `user.prov.session`), `--intent <i>` (exact match), `--since <dur>` (`24h`, `7d`, `30m`, `10s` — trailing unit, integer magnitude).
+
+`user.prov.session` is classified before it's printed: a bare 32-hex string is an AgentNS id; `comm-chain:...;env:...;cwd:...;pid:...;uid:...` is the kernel LSM's enriched fallback (see `lsm/README.md`); `comm:<name>:pid:<n>` is this overlay's own legacy fallback; anything else prints as-is.
+
+An unstamped file is the normal case, not an error: every subcommand prints "no provenance" (or `{}` under `--json`) and exits `0`. A path that doesn't exist, or a real permission error, is reported to stderr and exits nonzero; `find` reports per-file errors during the walk but keeps walking.
+
+**Deviation from the PRD:** §4.4 lists `prov chain <path>` as walking `user.prov.history`; that's what's implemented here. (An earlier draft of this brief described `chain` as walking the path's *ancestor directories* instead — that's not what got built; the PRD's history-ring reading took precedence.)
+
 ## Build and test
 
 ```sh
@@ -58,7 +83,7 @@ cargo build
 cargo test
 ```
 
-19 tests — 16 unit across the `identity`, `skip`, `history`, and `xattrs` modules, plus 3 integration. The integration suite skips cleanly when the temp filesystem doesn't support user xattrs, so a machine without xattr support reports honestly rather than failing.
+47 tests — 40 unit (across `identity`, `skip`, `history`, `xattrs`, `session`, `duration`, and `reader`) plus 7 integration-style (3 in `tests/integration.rs`, 4 more colocated in `reader.rs` under `#[cfg(target_os = "linux")]`). All of the xattr-backed suites skip cleanly when the temp filesystem doesn't support user xattrs, so a machine without xattr support reports honestly rather than failing.
 
 ## How it's built
 

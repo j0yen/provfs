@@ -25,10 +25,25 @@
 //! user.prov.ts       = RFC3339 instant
 //! user.prov.history  = CSV of up to 5 most-recent session ids, MRU first
 //! ```
+//!
+//! The `prov` reader CLI (`src/bin/prov.rs`, Phase 1 of the PRD) reads
+//! this same xattr set back off a path — from either this overlay or
+//! the in-kernel LSM under `lsm/`, which stamps a superset of these
+//! keys plus an enriched fallback string when no AgentNS session id is
+//! present. Its supporting logic lives in:
+//!
+//! - [`session`]: classify a `user.prov.session` value (AgentNS id vs.
+//!   the kernel's enriched fallback vs. this overlay's legacy fallback).
+//! - [`duration`]: parse the `24h`/`7d`/`30m` forms `prov find --since` takes.
+//! - [`reader`]: read the full xattr set off a path, parse `user.prov.ts`
+//!   and `user.prov.history`, and recursively walk a tree for `find`.
 
+pub mod duration;
 pub mod fs;
 pub mod history;
 pub mod identity;
+pub mod reader;
+pub mod session;
 pub mod skip;
 pub mod xattrs;
 

@@ -11,6 +11,10 @@ publish = false
 name = "provfs"
 path = "src/main.rs"
 
+[[bin]]
+name = "prov"
+path = "src/bin/prov.rs"
+
 [lib]
 name = "provfs"
 path = "src/lib.rs"
@@ -49,6 +53,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 log = "0.4"
 env_logger = "0.11"
 parking_lot = "0.12"
+sigpipe = "0.1.3"
+serde_json = "1.0.151"
 
 [dev-dependencies]
 tempfile = "3"
