@@ -17,7 +17,21 @@
  * (queue depth >= queue_max) or alloc failure we drop and bump a
  * counter — provenance is best-effort.
  *
- * See PRD-provfs-deferred-stamp.md.
+ * v0.4 (Phase 1) adds two independent things to this file:
+ *
+ *  - Three more best-effort payload fields (tool/turn/intent, read from
+ *    the writer's env by the hook — see provfs_lsm.c's env scanner) are
+ *    carried through the work item the same way session/ts already
+ *    were, and stamped as user.prov.{tool,turn,intent} — but only when
+ *    non-empty, so a missing env var never produces an empty xattr.
+ *
+ *  - The v0.1-v0.3 hardcoded skip-prefix array is replaced by a
+ *    runtime-tunable, comma-separated list at
+ *    /proc/sys/kernel/provfs/skip_prefixes, guarded by a rwlock
+ *    (provfs_skip_lock) since the matcher runs in task context on the
+ *    file_release path and must not race a concurrent sysctl write.
+ *
+ * See PRD-provfs-deferred-stamp.md, PRD-provenance-fs.md §4.1 (Phase 1).
  */
 
 #include <linux/atomic.h>
@@ -27,6 +41,7 @@
 #include <linux/kernel.h>
 #include <linux/mnt_idmapping.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>	/* rwlock_t for the skip_prefixes buffer */
 #include <linux/string.h>
 #include <linux/sysctl.h>
 #include <linux/workqueue.h>
@@ -40,6 +55,9 @@ struct provfs_stamp_work {
 	struct mnt_idmap	*idmap;
 	char			session[PROV_IDENT_MAX];
 	char			ts[PROV_TS_MAX];
+	char			tool[PROV_FIELD_MAX];	/* v0.4: $CLAUDE_TOOL */
+	char			turn[PROV_FIELD_MAX];	/* v0.4: $CLAUDE_TURN */
+	char			intent[PROV_FIELD_MAX];	/* v0.4: $AGENTNS_INTENT */
 };
 
 static struct workqueue_struct *provfs_wq;
@@ -56,6 +74,78 @@ static atomic64_t provfs_queue_dropped = ATOMIC64_INIT(0);
 static int provfs_queue_max = 1024;
 static int provfs_queue_max_min = 1;
 static int provfs_queue_max_max = 1 << 20;
+
+/*
+ * v0.4: sysctl-tunable skip-prefix list, replacing the v0.1-v0.3
+ * hardcoded array. Comma-separated substrings; a path is skipped
+ * (stamping suppressed) if any of them appears anywhere in it — same
+ * matcher semantics as the old array, just runtime-writable at
+ * /proc/sys/kernel/provfs/skip_prefixes.
+ *
+ * provfs_skip_lock guards the buffer against a torn read: the hook
+ * runs in task context on file_release (no atomic requirement), so a
+ * plain rwlock is enough — readers (the hook, and a sysctl read) take
+ * a brief read_lock() just to snapshot the buffer into a local copy;
+ * a sysctl write stages the new value in a local buffer first (so the
+ * lock is never held across copy_from_user(), which can sleep) and
+ * then takes write_lock() only for the final in-kernel copy.
+ */
+#define PROVFS_SKIP_MAX		1024
+#define PROVFS_SKIP_DEFAULT \
+	"/proc/,/sys/,/dev/,/run/,/tmp/,/var/run/,/var/cache/," \
+	"/var/lib/pacman/,/.git/,/node_modules/,/target/,/.cargo/registry/"
+
+static char provfs_skip_prefixes_buf[PROVFS_SKIP_MAX] = PROVFS_SKIP_DEFAULT;
+static DEFINE_RWLOCK(provfs_skip_lock);
+
+bool provfs_path_skipped(const char *path)
+{
+	char local[PROVFS_SKIP_MAX];
+	char *cursor, *tok;
+
+	if (!path)
+		return true;
+
+	read_lock(&provfs_skip_lock);
+	strscpy(local, provfs_skip_prefixes_buf, sizeof(local));
+	read_unlock(&provfs_skip_lock);
+
+	cursor = local;
+	while ((tok = strsep(&cursor, ",")) != NULL) {
+		if (*tok && strstr(path, tok))
+			return true;
+	}
+	return false;
+}
+
+static int provfs_sysctl_skip_prefixes(const struct ctl_table *table,
+					int write, void *buffer, size_t *lenp,
+					loff_t *ppos)
+{
+	struct ctl_table t = *table;
+	char staging[PROVFS_SKIP_MAX];
+	int ret;
+
+	/* Snapshot the current value under the lock first either way. */
+	read_lock(&provfs_skip_lock);
+	strscpy(staging, provfs_skip_prefixes_buf, sizeof(staging));
+	read_unlock(&provfs_skip_lock);
+
+	/*
+	 * Hand proc_dostring() the staging copy, never the shared buffer
+	 * directly — it may copy_from_user()/copy_to_user(), which can
+	 * sleep, and provfs_skip_lock is a non-sleeping rwlock.
+	 */
+	t.data = staging;
+	ret = proc_dostring(&t, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	write_lock(&provfs_skip_lock);
+	strscpy(provfs_skip_prefixes_buf, staging, sizeof(provfs_skip_prefixes_buf));
+	write_unlock(&provfs_skip_lock);
+	return 0;
+}
 
 static int provfs_sysctl_depth(const struct ctl_table *table, int write,
 			       void *buffer, size_t *lenp, loff_t *ppos)
@@ -108,6 +198,13 @@ static struct ctl_table provfs_sysctl_table[] = {
 		.mode		= 0444,
 		.proc_handler	= provfs_sysctl_dropped,
 	},
+	{
+		.procname	= "skip_prefixes",
+		.data		= provfs_skip_prefixes_buf,
+		.maxlen		= sizeof(provfs_skip_prefixes_buf),
+		.mode		= 0644,
+		.proc_handler	= provfs_sysctl_skip_prefixes,
+	},
 };
 
 static void provfs_stamp_worker(struct work_struct *work)
@@ -125,13 +222,30 @@ static void provfs_stamp_worker(struct work_struct *work)
 	(void)__vfs_setxattr_noperm(w->idmap, w->dentry, PROV_TS_KEY,
 				    w->ts, strlen(w->ts), 0);
 
+	/*
+	 * v0.4: best-effort Phase-1 fields. Each is written only when
+	 * non-empty — a missing env var means no xattr at all, never an
+	 * empty one.
+	 */
+	if (w->tool[0])
+		(void)__vfs_setxattr_noperm(w->idmap, w->dentry, PROV_TOOL_KEY,
+					    w->tool, strlen(w->tool), 0);
+	if (w->turn[0])
+		(void)__vfs_setxattr_noperm(w->idmap, w->dentry, PROV_TURN_KEY,
+					    w->turn, strlen(w->turn), 0);
+	if (w->intent[0])
+		(void)__vfs_setxattr_noperm(w->idmap, w->dentry, PROV_INTENT_KEY,
+					    w->intent, strlen(w->intent), 0);
+
 	dput(w->dentry);
 	atomic_dec(&provfs_queue_depth);
 	kfree(w);
 }
 
 void provfs_enqueue_stamp(struct dentry *dentry, struct mnt_idmap *idmap,
-			  const char *session, const char *ts)
+			  const char *session, const char *ts,
+			  const char *tool, const char *turn,
+			  const char *intent)
 {
 	struct provfs_stamp_work *w;
 
@@ -150,6 +264,10 @@ void provfs_enqueue_stamp(struct dentry *dentry, struct mnt_idmap *idmap,
 	w->idmap = idmap;
 	strscpy(w->session, session, sizeof(w->session));
 	strscpy(w->ts, ts, sizeof(w->ts));
+	/* v0.4: best-effort, may be NULL or empty — strscpy("") is fine. */
+	strscpy(w->tool, tool ? tool : "", sizeof(w->tool));
+	strscpy(w->turn, turn ? turn : "", sizeof(w->turn));
+	strscpy(w->intent, intent ? intent : "", sizeof(w->intent));
 	INIT_WORK(&w->work, provfs_stamp_worker);
 
 	/*

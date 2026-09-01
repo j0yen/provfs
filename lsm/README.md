@@ -2,19 +2,22 @@
 
 In-tree Linux Security Module that stamps `user.prov.session` and
 `user.prov.ts` xattrs on every file successfully closed after being
-opened for write.
+opened for write. v0.4 adds three more best-effort xattrs read from the
+writer's environment — `user.prov.tool`, `user.prov.turn`,
+`user.prov.intent` — and a sysctl-tunable skip-prefix list.
 
 Pairs with the FUSE-overlay userspace half in `../src/` for filesystems
-that don't support user xattrs natively.
+that don't support user xattrs natively, and with the separately-shipped
+`prov` Rust CLI (userspace).
 
 ## Status
 
-Phase 0 of [PRD-provenance-fs.md](../../autobuilder/PRDs-archive/PRD-provenance-fs.md):
+v0.4, Phase 1 of [PRD-provenance-fs.md](../../autobuilder/PRDs-archive/PRD-provenance-fs.md):
 
 | Phase | Scope | Status |
 |-------|-------|--------|
 | 0 | `file_release` hook → stamp `user.prov.session` + `user.prov.ts`. Hardcoded skip-prefix list. | shipped |
-| 1 | Read `$CLAUDE_TOOL` / `$CLAUDE_SESSION` from `current->mm` via `access_remote_vm()`. Add `.tool`, `.turn`, `.intent`. | partial — env read shipped in the enriched fallback (v0.3); extra keys deferred |
+| 1 | Read `$CLAUDE_TOOL` / `$CLAUDE_TURN` / `$AGENTNS_INTENT` from `current->mm` via `access_remote_vm()`. Add `.tool`, `.turn`, `.intent`. Sysctl-tunable skip-prefix list. | shipped (v0.4) |
 | 2 | History ring (`user.prov.history`). | deferred |
 | 3 | AgentNS integration: read `agent_session_id` directly from `current->agent_ns`. | live — verified 2026-08-31 (first non-init agent NS on the box: `agentns-claude` launcher installed; stamp matched the wrapper's 32-hex session id, distinguishing the direct read from the fallback format) |
 
@@ -41,7 +44,7 @@ assembled at kernel build time. It ships as part of the
 To enable: `CONFIG_SECURITY_PROVFS=y` + add `provfs` to the `lsm=`
 kernel cmdline (or rely on `LSM_ORDER_MUTABLE` default registration).
 
-## Skip prefixes (hardcoded for v0.1)
+## Skip prefixes (sysctl-tunable, v0.4)
 
 ```
 /proc/  /sys/  /dev/  /run/  /tmp/
@@ -49,8 +52,25 @@ kernel cmdline (or rely on `LSM_ORDER_MUTABLE` default registration).
 /.git/  /node_modules/  /target/  /.cargo/registry/
 ```
 
-These substrings anywhere in the canonical path suppress stamping. A
-sysctl-tunable list lands in Phase 1.
+These substrings anywhere in the canonical path suppress stamping —
+this is the default list, loaded at boot into
+`/proc/sys/kernel/provfs/skip_prefixes`.
+
+The list is runtime-tunable: read/write a comma-separated string of
+substrings (max 1023 bytes) at that sysctl, e.g.
+
+```sh
+# add a project-local build dir to the default list
+echo "/proc/,/sys/,/dev/,/run/,/tmp/,/var/run/,/var/cache/,/var/lib/pacman/,/.git/,/node_modules/,/target/,/.cargo/registry/,/my-scratch/" \
+  > /proc/sys/kernel/provfs/skip_prefixes
+
+cat /proc/sys/kernel/provfs/skip_prefixes
+```
+
+A concurrent write can't tear a match seen by the `file_release` hook —
+the buffer is guarded by an internal rwlock (write path stages the new
+value before taking the lock, so it's never held across a
+`copy_from_user()`).
 
 ## Verify after boot
 
@@ -72,7 +92,31 @@ getfattr -n user.prov.session ~/hi.txt
 agentns-claude --intent test -- sh -c 'echo hi > ~/hi.txt'
 getfattr -n user.prov.session ~/hi.txt
 # user.prov.session="<32-hex id matching the launcher's session_id>"
+
+# Phase 1 (v0.4) fields — bare env values, one xattr per var, present
+# only when the writer's environment actually set it:
+CLAUDE_TOOL=/build CLAUDE_TURN=42 AGENTNS_INTENT=test \
+  bash -c 'echo hi > ~/hi.txt'
+getfattr -d ~/hi.txt
+# user.prov.tool="/build"
+# user.prov.turn="42"
+# user.prov.intent="test"
 ```
+
+### Phase-1 environment keys (v0.4)
+
+Three xattrs, each a bare env value (no `KEY=` prefix), truncated to 63
+bytes. Rendered in the same single pass over the writer's env block
+that produces the v0.3 fallback's `env:` field — see
+`provfs_scan_env()` / `provfs_scan_writer_env()` in `provfs_lsm.c`. Any
+env var absent from the writer's process means the corresponding xattr
+is never written at all (best-effort — no field is ever stamped empty):
+
+| xattr | source env var |
+|-------|-----------------|
+| `user.prov.tool` | `$CLAUDE_TOOL` |
+| `user.prov.turn` | `$CLAUDE_TURN` |
+| `user.prov.intent` | `$AGENTNS_INTENT` |
 
 ### Enriched fallback value format (v0.3, PRD-provfs-comm-richer)
 

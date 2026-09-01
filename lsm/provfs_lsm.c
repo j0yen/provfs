@@ -38,12 +38,33 @@
  *
  * The agentns-present path is unchanged: still the bare 32-hex id.
  *
+ * v0.4 (Phase 1, PRD-provenance-fs.md §4.1): two more independent
+ * additions.
+ *
+ * First, three more xattrs read from the writer's environment —
+ * user.prov.tool ($CLAUDE_TOOL), user.prov.turn ($CLAUDE_TURN), and
+ * user.prov.intent ($AGENTNS_INTENT) — each the bare env value
+ * (truncated to PROV_FIELD_MAX-1), stamped only when non-empty. These
+ * share the single access_remote_vm() pass the v0.3 enriched fallback
+ * already made over the env block: provfs_scan_env() takes a small
+ * table of {candidate keys, dest, destlen, keep-"KEY="-prefix} targets
+ * and fills every one of them from one walk of the block, so the v0.3
+ * fallback's "env:<KEY>=<val>" field and these three new bare fields
+ * come out of the same read. The v0.3 fallback's own selection (first
+ * matching env-block entry, in block order) is unchanged byte for
+ * byte — see provfs_scan_writer_env().
+ *
+ * Second, the skip-prefix list is no longer hardcoded: it is a
+ * runtime-tunable, comma-separated string at
+ * /proc/sys/kernel/provfs/skip_prefixes (see provfs_work.c), guarded
+ * there by a rwlock so a concurrent sysctl write can't tear a match
+ * taken from this hook's task context.
+ *
  * Phase 2 (deferred): history ring (user.prov.history).
  *
- * Skip prefix list is hardcoded for v0.1; sysctl tunable lands later.
- *
  * Per PRD-provenance-fs.md §4.1, paired with the existing FUSE-side
- * Rust crate at ~/wintermute/provfs/.
+ * Rust crate at ~/wintermute/provfs/, and with the separately-shipped
+ * `prov` userspace CLI.
  */
 
 #include <linux/dcache.h>
@@ -82,7 +103,11 @@
 #define PROV_ENV_VAL_MAX	48
 #define PROV_ENV_SCAN_MAX	4096	/* env bytes we are willing to scan */
 
-/* Env vars searched, in priority order; first match wins (§2.1, §4). */
+/*
+ * Env vars for the v0.3 enriched-fallback "env:" field, in priority
+ * order; first match (in env-block order, see provfs_scan_env()) wins
+ * (§2.1, §4). Unchanged by v0.4.
+ */
 static const char * const provfs_env_keys[] = {
 	"CLAUDE_TOOL=",
 	"AGORABUS_SID=",
@@ -90,29 +115,16 @@ static const char * const provfs_env_keys[] = {
 	NULL,
 };
 
+/* v0.4 (Phase 1): one specific env var per new xattr field. */
+static const char * const provfs_key_tool[] = { "CLAUDE_TOOL=", NULL };
+static const char * const provfs_key_turn[] = { "CLAUDE_TURN=", NULL };
+static const char * const provfs_key_intent[] = { "AGENTNS_INTENT=", NULL };
+
 /*
- * Hard-coded skip-prefix list (v0.1). The PRD calls for a sysctl-tunable
- * list; deferred to v0.2 to keep the initial change small.
+ * Skip-prefix matching is now sysctl-tunable (v0.4,
+ * /proc/sys/kernel/provfs/skip_prefixes) — see provfs_path_skipped() in
+ * provfs_work.c, declared in provfs_work.h.
  */
-static const char * const provfs_skip_prefixes[] = {
-	"/proc/", "/sys/", "/dev/", "/run/", "/tmp/",
-	"/var/run/", "/var/cache/", "/var/lib/pacman/",
-	"/.git/", "/node_modules/", "/target/", "/.cargo/registry/",
-	NULL,
-};
-
-static bool provfs_path_skipped(const char *path)
-{
-	const char *const *p;
-
-	if (!path)
-		return true;
-	for (p = provfs_skip_prefixes; *p; p++) {
-		if (strstr(path, *p))
-			return true;
-	}
-	return false;
-}
 
 /* True for the synthetic roots we stop the parent-walk at (§2.1). */
 static bool provfs_is_root_comm(const char *comm)
@@ -175,30 +187,45 @@ static size_t provfs_build_comm_chain(char *buf, size_t buflen)
 }
 
 /*
- * Search the current task's environment for the first of
- * provfs_env_keys[] and render "<KEY>=<val>" (KEY without the '=',
- * value truncated to PROV_ENV_VAL_MAX). Best effort: returns 0 if mm is
- * gone, env region is unreadable, or no key matched. Reads at most
- * PROV_ENV_SCAN_MAX bytes of the env block via access_remote_vm().
- *
- * Returns bytes written (excluding NUL), 0 on miss.
+ * One "find this env var, write it here" request for provfs_scan_env().
+ * @keys is a NULL-terminated list of candidate "KEY=" prefixes, checked
+ * in list order against each env entry; @dest/@destlen is where the
+ * match is rendered. @keep_prefix true renders "<KEY>=<val>" (KEY
+ * without the trailing '=', value capped at PROV_ENV_VAL_MAX — the v0.3
+ * enriched-fallback form); false renders the bare value only, truncated
+ * to fit @destlen (the v0.4 Phase-1 fields). @filled is scanner-owned
+ * state: once true, this target is skipped for the rest of the scan, so
+ * whichever env-block entry matches it first is never overwritten by a
+ * later one — this is what makes the v0.3 fallback's selection (first
+ * matching entry in block order) come out byte-for-byte identical
+ * whether it is the only target scanned or one of several.
  */
-static size_t provfs_build_env_signal(char *buf, size_t buflen)
+struct provfs_env_target {
+	const char * const *keys;
+	char *dest;
+	size_t destlen;
+	bool keep_prefix;
+	bool filled;
+};
+
+/*
+ * Single pass over the current task's environment, filling every
+ * not-yet-filled target in @targets whose key is found. Best effort:
+ * a target simply stays unfilled (caller pre-clears dest) if mm is
+ * gone, the env region is unreadable, or nothing matches. Reads at
+ * most PROV_ENV_SCAN_MAX bytes of the env block via access_remote_vm().
+ */
+static void provfs_scan_env(struct provfs_env_target *targets, size_t ntargets)
 {
 	struct mm_struct *mm;
 	char *env = NULL;
 	unsigned long start, end, len;
-	size_t got, out = 0;
+	size_t got;
 	size_t i;
-	const char *const *k;
-
-	if (!buf || buflen == 0)
-		return 0;
-	buf[0] = '\0';
 
 	mm = get_task_mm(current);
 	if (!mm)
-		return 0;
+		return;
 
 	/*
 	 * env_start/env_end bound argv's trailing environ block. They can
@@ -224,30 +251,46 @@ static size_t provfs_build_env_signal(char *buf, size_t buflen)
 
 	/*
 	 * The env block is a run of NUL-separated "KEY=value" entries.
-	 * Walk entry by entry; for each, test the priority key list.
+	 * Walk entry by entry; for each, test every target still open.
 	 */
 	i = 0;
 	while (i < got) {
 		const char *entry = env + i;
 		size_t elen = strnlen(entry, got - i);
+		size_t t;
 
-		for (k = provfs_env_keys; *k; k++) {
-			size_t klen = strlen(*k);
+		for (t = 0; t < ntargets; t++) {
+			struct provfs_env_target *tgt = &targets[t];
+			const char * const *k;
 
-			if (elen > klen && !strncmp(entry, *k, klen)) {
-				const char *val = entry + klen;
-				/* Drop the trailing '=' from the key label. */
-				char key[PROV_ENV_KEY_MAX];
-				size_t kn = klen - 1;
+			if (tgt->filled)
+				continue;
 
-				if (kn >= sizeof(key))
-					kn = sizeof(key) - 1;
-				memcpy(key, *k, kn);
-				key[kn] = '\0';
+			for (k = tgt->keys; *k; k++) {
+				size_t klen = strlen(*k);
+				const char *val;
 
-				out = scnprintf(buf, buflen, "%s=%.*s", key,
-						PROV_ENV_VAL_MAX, val);
-				goto out_free;
+				if (elen <= klen || strncmp(entry, *k, klen))
+					continue;
+
+				val = entry + klen;
+				if (tgt->keep_prefix) {
+					/* Drop the trailing '=' from the key label. */
+					char key[PROV_ENV_KEY_MAX];
+					size_t kn = klen - 1;
+
+					if (kn >= sizeof(key))
+						kn = sizeof(key) - 1;
+					memcpy(key, *k, kn);
+					key[kn] = '\0';
+
+					scnprintf(tgt->dest, tgt->destlen, "%s=%.*s",
+						  key, PROV_ENV_VAL_MAX, val);
+				} else {
+					scnprintf(tgt->dest, tgt->destlen, "%s", val);
+				}
+				tgt->filled = true;
+				break;
 			}
 		}
 
@@ -259,7 +302,31 @@ out_free:
 	kfree(env);
 out_mm:
 	mmput(mm);
-	return out;
+}
+
+/*
+ * Fill the v0.3 enriched-fallback "env:" field and the three v0.4
+ * Phase-1 fields (tool/turn/intent) from one provfs_scan_env() pass.
+ * Any/all may come back empty (env var absent, or mm gone/unreadable).
+ */
+static void provfs_scan_writer_env(char *envsig, size_t envsiglen,
+				    char *tool, size_t toollen,
+				    char *turn, size_t turnlen,
+				    char *intent, size_t intentlen)
+{
+	struct provfs_env_target targets[] = {
+		{ provfs_env_keys,   envsig, envsiglen, true,  false },
+		{ provfs_key_tool,   tool,   toollen,   false, false },
+		{ provfs_key_turn,   turn,   turnlen,   false, false },
+		{ provfs_key_intent, intent, intentlen, false, false },
+	};
+
+	envsig[0] = '\0';
+	tool[0] = '\0';
+	turn[0] = '\0';
+	intent[0] = '\0';
+
+	provfs_scan_env(targets, ARRAY_SIZE(targets));
 }
 
 /*
@@ -309,10 +376,9 @@ static size_t provfs_build_cwd(char *buf, size_t buflen)
  * sized for them). This drops fields from the right on overflow, which
  * preserves the outermost-actor signal at the front per §2.2.
  */
-static void provfs_build_fallback(char *buf, size_t buflen)
+static void provfs_build_fallback(char *buf, size_t buflen, const char *envsig)
 {
 	char chain[PROV_CHAIN_MAX];
-	char env[PROV_ENV_KEY_MAX + PROV_ENV_VAL_MAX + 2];
 	char *cwd;
 	u32 uid = from_kuid(&init_user_ns, current_uid());
 	u32 pid = (u32)current->tgid;
@@ -329,10 +395,15 @@ static void provfs_build_fallback(char *buf, size_t buflen)
 			off += n;
 	}
 
-	/* env signal (CLAUDE_TOOL / AGORABUS_SID / CLAUDE_SESSION_ID). */
-	if (provfs_build_env_signal(env, sizeof(env)) > 0) {
+	/*
+	 * env signal (CLAUDE_TOOL / AGORABUS_SID / CLAUDE_SESSION_ID).
+	 * @envsig is pre-rendered by the caller's single provfs_scan_env()
+	 * pass (v0.4) — see provfs_scan_writer_env(); this is the same
+	 * value the old (now-folded-in) single-purpose scan used to render.
+	 */
+	if (envsig && envsig[0]) {
 		n = snprintf(buf + off, buflen - off, "%senv:%s",
-			     off ? ";" : "", env);
+			     off ? ";" : "", envsig);
 		if (n > 0 && (size_t)n < buflen - off)
 			off += n;
 	}
@@ -369,7 +440,7 @@ static void provfs_build_fallback(char *buf, size_t buflen)
 		snprintf(buf, buflen, "pid:%u;uid:%u", pid, uid);
 }
 
-static void provfs_build_session(char *buf, size_t buflen)
+static void provfs_build_session(char *buf, size_t buflen, const char *envsig)
 {
 #ifdef CONFIG_AGENT_NS
 	/*
@@ -393,7 +464,7 @@ static void provfs_build_session(char *buf, size_t buflen)
 	 * innermost-comm-only string. Rendered here at hook time (writer's
 	 * task context) and carried verbatim through the work payload.
 	 */
-	provfs_build_fallback(buf, buflen);
+	provfs_build_fallback(buf, buflen, envsig);
 }
 
 /*
@@ -413,6 +484,10 @@ static void provfs_stamp(struct file *file)
 	char *path_str;
 	char session_val[PROV_IDENT_MAX];
 	char ts_val[PROV_TS_MAX];
+	char envsig_val[PROV_ENV_KEY_MAX + PROV_ENV_VAL_MAX + 2];
+	char tool_val[PROV_FIELD_MAX];
+	char turn_val[PROV_FIELD_MAX];
+	char intent_val[PROV_FIELD_MAX];
 
 	/*
 	 * file_release fires during fput, including from exit_files() after
@@ -452,11 +527,23 @@ static void provfs_stamp(struct file *file)
 	}
 	kfree(path_buf);
 
-	provfs_build_session(session_val, sizeof(session_val));
+	/*
+	 * v0.4: one env scan feeds both the enriched fallback's "env:"
+	 * field and the Phase-1 tool/turn/intent xattrs — see
+	 * provfs_scan_writer_env(). Best effort throughout: a torn-down or
+	 * unreadable mm just leaves every field empty.
+	 */
+	provfs_scan_writer_env(envsig_val, sizeof(envsig_val),
+			       tool_val, sizeof(tool_val),
+			       turn_val, sizeof(turn_val),
+			       intent_val, sizeof(intent_val));
+
+	provfs_build_session(session_val, sizeof(session_val), envsig_val);
 	snprintf(ts_val, sizeof(ts_val), "%lld", ktime_get_real_seconds());
 
 	/* Defer the journaled xattr writes off this hot/teardown path. */
-	provfs_enqueue_stamp(dentry, idmap, session_val, ts_val);
+	provfs_enqueue_stamp(dentry, idmap, session_val, ts_val,
+			     tool_val, turn_val, intent_val);
 }
 
 static void provfs_file_release(struct file *file)
@@ -494,7 +581,7 @@ static int __init provfs_init(void)
 		return ret;
 	}
 
-	pr_info("provfs: LSM registered (v0.3, deferred stamping + enriched fallback)\n");
+	pr_info("provfs: LSM registered (v0.4, Phase 1: tool/turn/intent keys + sysctl skip list)\n");
 	return 0;
 }
 
