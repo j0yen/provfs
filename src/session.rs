@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn classifies_agentns_id() {
-        let id = "01234567890abcdef01234567890abc";
+        let id = "0123456789abcdef0123456789abcdef";
         assert_eq!(classify(id), SessionKind::AgentNs(id.to_string()));
     }
 
